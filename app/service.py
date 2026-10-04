@@ -2205,3 +2205,257 @@ class AuditService:
             "permit_revision": used_permit_revision,
             "zones": zone_results,
         }
+
+    # ------------------------------------------------------------------
+    # 作业车按工序顺序进入危险区复核
+    # ------------------------------------------------------------------
+
+    def query_operation_sequence(self, trip_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """复核单车是否按给定工序顺序依次进入相应危险区。
+
+        - 输入：车次、带时区 UTC 半开查询时段、至少两道有序工序
+          （每道危险区 ID + 正且有限连续停留秒数；第二道起另给非负且有限的
+          最长交接秒数），可选区域修订号与轨迹版本，允许同一区重复出现；
+        - 每道工序须在**一次连续占用**中取得**足额**证据：证据为该道危险区
+          某个连续占用区间内、时长恰为停留秒数的子区间；各道证据互不重叠，
+          后一道开始不早于前一道结束，且与前一道结束的间隔不超过交接上限；
+        - 区域配置（含指定修订号）与车次点集（含指定/最新版本）从
+          **同一已提交读视图**读取，沿用插值、区域生效时段与带洞边界规则；
+        - 贪心求**最早最终结束时刻**的可行安排（每道取允许的最早证据），
+          返回该时刻及逐道证据区间与实际使用的版本；无可行顺序时
+          completed=false、final_end=null、evidence=[]。
+        """
+        if not isinstance(trip_id, str) or not trip_id.strip():
+            raise ValidationError("trip_id 必须是非空字符串")
+        trip_id = trip_id.strip()
+
+        try:
+            lo = parse_utc(payload.get("since"), field="since").timestamp()
+            hi = parse_utc(payload.get("until"), field="until").timestamp()
+        except TimeError as exc:
+            raise ValidationError(str(exc)) from exc
+        if lo >= hi:
+            raise ValidationError("since 必须早于 until（查询范围为半开 [since, until)）")
+
+        steps_raw = payload.get("steps")
+        if not isinstance(steps_raw, list) or len(steps_raw) < 2:
+            raise ValidationError("steps 必须包含至少两道有序工序")
+
+        steps: List[Tuple[str, float, Optional[float]]] = []
+        for idx, item in enumerate(steps_raw):
+            if not isinstance(item, dict):
+                raise ValidationError(f"steps[{idx}] 必须是对象")
+            zid_raw = item.get("zone_id")
+            if not isinstance(zid_raw, str) or not zid_raw.strip():
+                raise ValidationError(f"steps[{idx}].zone_id 必须是非空字符串")
+            zid = zid_raw.strip()
+            duration = self._validate_positive_finite(
+                item.get("duration_sec"), f"steps[{idx}].duration_sec 连续停留秒数"
+            )
+            handoff_raw = item.get("max_handoff_sec")
+            if idx == 0:
+                if handoff_raw is not None:
+                    raise ValidationError(
+                        "steps[0].max_handoff_sec 不应给出：交接上限自第二道工序起提供"
+                    )
+                handoff: Optional[float] = None
+            else:
+                if handoff_raw is None:
+                    raise ValidationError(
+                        f"steps[{idx}].max_handoff_sec 缺失：自第二道工序起必须给出"
+                        "非负且有限的最长交接秒数（允许 0）"
+                    )
+                handoff = self._validate_nonneg_finite(
+                    handoff_raw, f"steps[{idx}].max_handoff_sec 最长交接秒数"
+                )
+            steps.append((zid, duration, handoff))
+
+        pinned_rev = payload.get("revision") is not None
+        revision = _validate_revision_param(payload.get("revision")) if pinned_rev else None
+
+        pinned_track = payload.get("track_version") is not None
+        track_version = (
+            self._validate_track_version_value(payload.get("track_version"))
+            if pinned_track
+            else None
+        )
+
+        # ---- 同一已提交读视图：区域配置 + 车次点集一次快照读取 ----
+        used_version = track_version  # 指定轨迹版本时原样回填
+        with self.db.read_view() as conn:
+            if pinned_track:
+                baseline, head = self.db._trip_version_info(conn, trip_id)
+                self._check_track_version_range(trip_id, track_version, baseline, head)
+                points = self.db._list_trip_point_version_rows(conn, trip_id, track_version)
+            else:
+                vrow = self.db._trip_version_row(conn, trip_id)
+                points = self.db._list_trip_points(conn, trip_id)
+                if vrow is None and not points:
+                    raise NotFoundError(f"车次不存在（无轨迹数据）: {trip_id}")
+                used_version = 0 if vrow is None else int(vrow["version"])
+
+            if pinned_rev:
+                head_rev = self.db._current_revision(conn)
+                if revision > head_rev:
+                    raise NotFoundError(
+                        f"修订号 {revision} 超出当前范围：当前最新修订号为 {head_rev}"
+                        + ("（尚无任何区域登记）" if head_rev == 0 else "")
+                    )
+                used_revision = revision
+            else:
+                used_revision = self.db._current_revision(conn)
+
+            # 逐道取截至修订号的最后配置（未指定取最新）；未知区/该版本尚未登记明确拒绝。
+            # 同一区重复出现时复用同一行配置，但占用区间按工序顺序各自独立核算。
+            zone_cache: Dict[str, Any] = {}
+            coverages: List[List[Tuple[float, float]]] = []
+            for zid, _duration, _handoff in steps:
+                if zid not in zone_cache:
+                    if pinned_rev:
+                        zrow = self.db._zone_row_at(conn, zid, revision)
+                        if zrow is None:
+                            raise NotFoundError(
+                                f"修订号 {revision} 的配置中危险区尚未登记: {zid}"
+                            )
+                    else:
+                        zrow = self.db._latest_zone_row(conn, zid)
+                        if zrow is None:
+                            raise NotFoundError(f"危险区不存在: {zid}")
+                    zone_cache[zid] = zrow
+                # 各区占用沿用插值/生效窗口/带洞边界/查询半开裁剪/零时长规则
+                coverages.append(self._coverage_intervals(zone_cache[zid], points, lo, hi))
+
+        # ---- 可行起点集合传播（区间并集），求最早最终结束时刻 ----
+        # 第 k 道证据 [s, s+d_k) 必须整体落在该道某一连续占用区间 [a,b) 内，
+        # 故该道“候选起点集合” C_k = ⋃_占用 [a, b-d_k]（已被查询半开窗口裁剪）。
+        # 顺序约束：前道结束 e_{k-1} ≤ s_k（互不重叠、不倒退）且
+        # s_k - e_{k-1} ≤ handoff_k（交接间隔不超上限）。
+        # 递推可行起点集合：S_0 = C_0；
+        # S_k = C_k ∩ ⋃_{e∈S_{k-1}+d_{k-1}} [e, e+handoff_k]。
+        # 区间并集上的交/扩张均为精确运算；最早最终结束 = min(S_{n-1}) + d_{n-1}。
+        eps = 1e-9
+
+        def _union(ivs: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+            ordered = sorted((min(a, b), max(a, b)) for a, b in ivs if b + eps >= a)
+            merged: List[List[float]] = []
+            for a, b in ordered:
+                if not merged or a > merged[-1][1] + eps:
+                    merged.append([a, b])
+                elif b > merged[-1][1]:
+                    merged[-1][1] = b
+            return [(a, b) for a, b in merged]
+
+        def _intersect(
+            A: List[Tuple[float, float]], B: List[Tuple[float, float]]
+        ) -> List[Tuple[float, float]]:
+            out: List[Tuple[float, float]] = []
+            for a1, b1 in A:
+                for a2, b2 in B:
+                    lo2, hi2 = max(a1, a2), min(b1, b2)
+                    if hi2 + eps >= lo2:  # 保留单点可行集（handoff=0 的瞬时相接）
+                        out.append((lo2, hi2))
+            return _union(out)
+
+        feasible: List[List[Tuple[float, float]]] = []
+        for idx, ((_zid, duration, handoff), intervals) in enumerate(zip(steps, coverages)):
+            starts = _union([
+                (a, b - duration)
+                for a, b in intervals
+                if b - duration >= a - eps
+            ])
+            if idx == 0:
+                sk = starts
+            else:
+                assert handoff is not None
+                # 前道可行结束集合 E_{k-1} = S_{k-1} 整体平移 d_{k-1}；
+                # e∈[ea,eb] 与允许的本道开始 s∈[e, e+handoff] 的并集 = [ea, eb+handoff]
+                prev_d = steps[idx - 1][1]
+                allowed = [
+                    (a + prev_d, b + prev_d + handoff)
+                    for a, b in feasible[idx - 1]
+                ]
+                sk = _intersect(starts, _union(allowed))
+            feasible.append(sk)
+
+        evidence: List[Tuple[float, float]] = []
+        completed = bool(feasible[-1])
+        if completed:
+            n = len(steps)
+            # 末道取最早可行开始，得到最早最终结束；再逆向传播“仍可完成”的
+            # 开始集合 B_k，回溯时每道取其最早可行开始（对应最早逐道证据）。
+            must: List[List[Tuple[float, float]]] = [[] for _ in range(n)]
+            must[-1] = [(feasible[-1][0][0], feasible[-1][0][0])]
+            chosen_starts: List[float] = [0.0] * n
+            chosen_starts[-1] = feasible[-1][0][0]
+            for k in range(n - 1, 0, -1):
+                h = steps[k][2]
+                assert h is not None
+                prev_d = steps[k - 1][1]
+                # 后道开始集合 must_k = ⋃[g,ḡ]（末道为单点）；前道结束 e 可行当且仅当
+                # 存在后道开始 s∈[g,ḡ] 使 s-h ≤ e ≤ s，故 e ∈ ⋃[g-h, ḡ]；
+                # 再与前道可行结束集合 S_{k-1}+d 求交，平移回前道开始集合
+                reachable = [(g - h, g2) for g, g2 in must[k]]
+                prev_ends = [
+                    (a + prev_d, b + prev_d) for a, b in feasible[k - 1]
+                ]
+                ok_ends = _intersect(prev_ends, reachable)
+                must[k - 1] = [(a - prev_d, b - prev_d) for a, b in ok_ends]
+                if not must[k - 1]:  # 理论不可达：正向传播保证必有解
+                    completed = False
+                    break
+                chosen_starts[k - 1] = must[k - 1][0][0]
+            if completed:
+                for k, s in enumerate(chosen_starts):
+                    evidence.append((s, s + steps[k][1]))
+
+        def _interval_payload(idx: int, s: float, e: float) -> Dict[str, Any]:
+            return {
+                "step": idx + 1,
+                "zone_id": steps[idx][0],
+                "required_duration_sec": steps[idx][1],
+                "start": _iso_z(datetime.fromtimestamp(s, timezone.utc)),
+                "end": _iso_z(datetime.fromtimestamp(e, timezone.utc)),
+                "duration_sec": round(e - s, 6),
+                "max_handoff_sec": (
+                    None if steps[idx][2] is None else steps[idx][2]
+                ),
+                "actual_handoff_sec": (
+                    None
+                    if idx == 0
+                    else round(s - evidence[idx - 1][1], 6)
+                ),
+            }
+
+        result: Dict[str, Any] = {
+            "trip_id": trip_id,
+            "since": _iso_z(datetime.fromtimestamp(lo, timezone.utc)),
+            "until": _iso_z(datetime.fromtimestamp(hi, timezone.utc)),
+            "point_count": len(points),
+            "completed": completed,
+            "final_end": (
+                _iso_z(datetime.fromtimestamp(evidence[-1][1], timezone.utc))
+                if completed
+                else None
+            ),
+            "evidence": (
+                [_interval_payload(i, s, e) for i, (s, e) in enumerate(evidence)]
+                if completed
+                else []
+            ),
+            "revision": used_revision,
+            "track_version": used_version,
+        }
+        return result
+
+    @staticmethod
+    def _validate_nonneg_finite(raw: Any, field: str) -> float:
+        """校验非负且有限的数值（交接上限）；非法值明确拒绝（400）。"""
+        if isinstance(raw, bool):
+            raise ValidationError(f"{field}必须是非负且有限的数值，收到: {raw!r}")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise ValidationError(f"{field}必须是非负且有限的数值，收到: {raw!r}")
+        if not math.isfinite(value) or value < 0:
+            raise ValidationError(f"{field}必须是非负且有限的数值，收到: {raw!r}")
+        return value

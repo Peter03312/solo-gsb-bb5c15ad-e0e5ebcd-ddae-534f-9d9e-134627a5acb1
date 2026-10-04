@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from .config import get_settings
 from .db import Database
-from .schemas import CoOccupancyQuery, ContactTracingQuery, CorrectionBatch, PermitCreate, PermitReviewQuery, PermitRevoke, PointBatch, ProximityQuery, RiskBudgetQuery, SpeedingReviewQuery, ZoneCreate
+from .schemas import CoOccupancyQuery, ContactTracingQuery, CorrectionBatch, OperationSequenceQuery, PermitCreate, PermitReviewQuery, PermitRevoke, PointBatch, ProximityQuery, RiskBudgetQuery, SpeedingReviewQuery, ZoneCreate
 from .service import AuditService, ConflictError, NotFoundError, ValidationError
 
 settings = get_settings()
@@ -26,7 +26,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="工地作业车危险区穿越审计服务",
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
     description=(
         "登记带洞米制多边形危险区及其 UTC 半开生效时段；每次登记原子产生全局递增修订号，"
@@ -57,6 +57,9 @@ app = FastAPI(
         "过期或重复撤销拒绝。许可复核按同一已提交读视图（可选区域修订号、轨迹版本、"
         "许可修订号；无许可时许可修订号为 0）核对单车次在各区的实际占用，"
         "重叠许可时段取并集，按区返回无许可的正时长区间、累计秒数与实际使用的三个版本。"
+        "作业车工序顺序复核按同一已提交读视图核对单车是否按给定有序工序依次进入"
+        "相应危险区：每道须在一次连续占用中取得足额且互不重叠的证据时段，"
+        "后道开始不早于前道结束且交接间隔不超过上限，返回最早最终结束时刻及逐道证据。"
     ),
 )
 
@@ -109,6 +112,7 @@ def index() -> dict:
             "GET  /api/v1/permits/{permit_id}",
             "GET  /api/v1/permit-revisions",
             "POST /api/v1/trips/{trip_id}/permit-review",
+            "POST /api/v1/trips/{trip_id}/operation-sequence",
         ],
     }
 
@@ -337,6 +341,15 @@ def query_permit_review(trip_id: str, body: PermitReviewQuery) -> dict:
     许可修订视图下仍有效的许可（重叠时段取并集）；按区返回无许可正时长区间、累计秒数
     与实际使用的区域修订号、轨迹版本、许可修订号（无许可时为 0）。"""
     return service.query_permit_review(trip_id, body.model_dump())
+
+
+@app.post("/api/v1/trips/{trip_id}/operation-sequence")
+def query_operation_sequence(trip_id: str, body: OperationSequenceQuery) -> dict:
+    """作业车按工序顺序进入危险区复核：区域配置与车次点集从同一已提交读视图读取；
+    每道工序须在一次连续占用中取得足额且互不重叠的证据时段，后道开始不早于前道结束、
+    间隔不超过交接上限；返回能完成时的最早最终结束时刻及逐道证据区间与实际版本，
+    无可行顺序明确返回未完成与空证据。"""
+    return service.query_operation_sequence(trip_id, body.model_dump())
 
 
 if __name__ == "__main__":

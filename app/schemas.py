@@ -218,6 +218,46 @@ class ContactTracingQuery(BaseModel):
     )
 
 
+class SequenceStep(BaseModel):
+    """工序顺序复核中的一道工序：危险区 ID + 正且有限的连续停留秒数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    zone_id: str = Field(..., min_length=1, description="本道工序的危险区 ID（允许与其他工序重复）")
+    duration_sec: Annotated[
+        float, Field(gt=0, strict=True, allow_inf_nan=False)
+    ] = Field(..., description="正且有限：须在一次连续占用中取得的足额停留秒数")
+    max_handoff_sec: Optional[
+        Annotated[float, Field(ge=0, strict=True, allow_inf_nan=False)]
+    ] = Field(
+        default=None,
+        description=(
+            "非负且有限：自第二道起给出，前一道证据结束到本道证据开始的最长允许间隔"
+            "（含 0，表示须相接）；第一道不应给出"
+        ),
+    )
+
+
+class OperationSequenceQuery(BaseModel):
+    """作业车按工序顺序进入危险区复核请求。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    since: str = Field(..., description="查询起始 UTC ISO 8601（含），必须带时区")
+    until: str = Field(..., description="查询结束 UTC ISO 8601（不含），必须带时区")
+    steps: List[SequenceStep] = Field(
+        ..., min_length=2, description="至少两道有序工序；第二道起须给 max_handoff_sec"
+    )
+    revision: Optional[int] = Field(
+        default=None, ge=1, description="可选区域修订号：按截至该号的区域配置核算"
+    )
+    track_version: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="可选轨迹版本号：按该版本保留的有效点集核算，响应回填实际使用版本",
+    )
+
+
 class PermitCreate(BaseModel):
     """作业车进入危险区通行许可登记请求：许可 ID + 车次 + 危险区 + UTC 半开覆盖时段。"""
 
