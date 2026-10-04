@@ -2205,3 +2205,264 @@ class AuditService:
             "permit_revision": used_permit_revision,
             "zones": zone_results,
         }
+
+    # ------------------------------------------------------------------
+    # 作业车工序顺序复核
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_nonneg_finite(raw: Any, field: str) -> float:
+        """校验非负且有限的数值（最长交接秒数）；非法值明确拒绝（400）。"""
+        if isinstance(raw, bool):
+            raise ValidationError(f"{field}必须是非负且有限的数值，收到: {raw!r}")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise ValidationError(f"{field}必须是非负且有限的数值，收到: {raw!r}")
+        if not math.isfinite(value) or value < 0:
+            raise ValidationError(f"{field}必须是非负且有限的数值，收到: {raw!r}")
+        return value
+
+    @staticmethod
+    def _merge_closed_starts(
+        intervals: List[Tuple[float, float]], eps: float = 1e-9
+    ) -> List[Tuple[float, float]]:
+        """合并重叠或相接的闭区间（可行证据开始时刻集；保留零宽点区间）。"""
+        merged: List[List[float]] = []
+        for a, b in sorted(intervals):
+            if b < a:
+                continue  # 防御：负宽度区间不可行
+            if merged and a <= merged[-1][1] + eps:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        return [(a, b) for a, b in merged]
+
+    @staticmethod
+    def _intersect_closed_starts(
+        first: List[Tuple[float, float]],
+        second: List[Tuple[float, float]],
+        eps: float = 1e-9,
+    ) -> List[Tuple[float, float]]:
+        """两个有序闭区间列表求交（保留零宽交点）。"""
+        out: List[Tuple[float, float]] = []
+        i = j = 0
+        while i < len(first) and j < len(second):
+            a0, a1 = first[i]
+            b0, b1 = second[j]
+            lo, hi = max(a0, b0), min(a1, b1)
+            if lo <= hi + eps:
+                out.append((lo, max(lo, hi)))
+            if a1 <= b1:
+                i += 1
+            else:
+                j += 1
+        return out
+
+    def query_sequence_review(self, trip_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """复核作业车是否按给定工序顺序进入危险区。
+
+        - 输入：车次、带时区 UTC 半开查询时段、至少两道有序工序（每道：危险区 ID +
+          正且有限的连续停留秒数；第二道起另给非负且有限的最长交接秒数），
+          可选区域修订号与轨迹版本；
+        - 各区占用沿用既有轨迹插值、区域生效时段与带洞边界规则；
+          区域配置与车次点集取自**同一已提交读视图**；
+        - 每道工序须在**一次连续占用**中取得足额且互不重叠的证据时段；
+          后一道证据开始不得早于前一道证据结束，间隔不超过其交接上限；
+          允许同一危险区在不同工序中重复出现；
+        - 以区间传播求出每道工序全部可行的证据开始时刻集（证据 [x, x+d) 落在一次
+          连续占用 [s, e) 内 ⟺ x ∈ [s, e−d]；前道可行结束集 ⊕ [0, 交接上限] 再与
+          本道可行开始集求交），能完成时取**最早最终结束时刻**并逐道回溯证据区间；
+          无可行顺序返回 completed=false 与空证据；
+        - 响应总是回填实际使用的区域修订号与轨迹版本。
+        """
+        if not isinstance(trip_id, str) or not trip_id.strip():
+            raise ValidationError("trip_id 必须是非空字符串")
+        trip_id = trip_id.strip()
+
+        try:
+            lo = parse_utc(payload.get("since"), field="since").timestamp()
+            hi = parse_utc(payload.get("until"), field="until").timestamp()
+        except TimeError as exc:
+            raise ValidationError(str(exc)) from exc
+        if lo >= hi:
+            raise ValidationError("since 必须早于 until（查询范围为半开 [since, until)）")
+
+        steps_raw = payload.get("steps")
+        if not isinstance(steps_raw, list) or len(steps_raw) < 2:
+            raise ValidationError("steps 必须包含至少两道有序工序")
+        steps: List[Dict[str, Any]] = []
+        for idx, item in enumerate(steps_raw):
+            if not isinstance(item, dict):
+                raise ValidationError(f"steps[{idx}] 必须是对象")
+            zid_raw = item.get("zone_id")
+            if not isinstance(zid_raw, str) or not zid_raw.strip():
+                raise ValidationError(f"steps[{idx}].zone_id 必须是非空字符串")
+            zid = zid_raw.strip()
+            stay = self._validate_positive_finite(
+                item.get("min_stay_sec"), f"steps[{idx}].min_stay_sec 连续停留秒数"
+            )
+            handover_raw = item.get("max_handover_sec")
+            if idx == 0:
+                if handover_raw is not None:
+                    raise ValidationError(
+                        "steps[0] 为第一道工序，无前序交接，不应提供 max_handover_sec"
+                    )
+                handover = None
+            else:
+                if handover_raw is None:
+                    raise ValidationError(
+                        f"steps[{idx}].max_handover_sec 缺失：第二道起每道工序必须给出"
+                        "非负且有限的最长交接秒数"
+                    )
+                handover = self._validate_nonneg_finite(
+                    handover_raw, f"steps[{idx}].max_handover_sec 最长交接秒数"
+                )
+            steps.append(
+                {"zone_id": zid, "min_stay_sec": stay, "max_handover_sec": handover}
+            )
+
+        pinned_rev = payload.get("revision") is not None
+        revision = (
+            _validate_revision_param(payload.get("revision")) if pinned_rev else None
+        )
+        pinned_track = payload.get("track_version") is not None
+        track_version = (
+            self._validate_track_version_value(payload.get("track_version"))
+            if pinned_track
+            else None
+        )
+
+        # ---- 同一已提交读视图：区域配置 + 车次点集一次快照读取 ----
+        with self.db.read_view() as conn:
+            if pinned_track:
+                baseline, head_v = self.db._trip_version_info(conn, trip_id)
+                self._check_track_version_range(trip_id, track_version, baseline, head_v)
+                points = self.db._list_trip_point_version_rows(conn, trip_id, track_version)
+                used_version = track_version
+            else:
+                vrow = self.db._trip_version_row(conn, trip_id)
+                points = self.db._list_trip_points(conn, trip_id)
+                if vrow is None and not points:
+                    raise NotFoundError(f"车次不存在（无轨迹数据）: {trip_id}")
+                used_version = 0 if vrow is None else int(vrow["version"])
+
+            if pinned_rev:
+                head_rev = self.db._current_revision(conn)
+                if revision > head_rev:
+                    raise NotFoundError(
+                        f"修订号 {revision} 超出当前范围：当前最新修订号为 {head_rev}"
+                        + ("（尚无任何区域登记）" if head_rev == 0 else "")
+                    )
+                used_revision = revision
+            else:
+                used_revision = self.db._current_revision(conn)
+
+            # 各工序涉及的危险区（去重）取截至修订号的最后配置；未知区/未登记明确拒绝
+            zone_rows: Dict[str, Any] = {}
+            for step in steps:
+                zid = step["zone_id"]
+                if zid in zone_rows:
+                    continue
+                if pinned_rev:
+                    zrow = self.db._zone_row_at(conn, zid, revision)
+                    if zrow is None:
+                        raise NotFoundError(
+                            f"修订号 {revision} 的配置中危险区尚未登记: {zid}"
+                        )
+                else:
+                    zrow = self.db._latest_zone_row(conn, zid)
+                    if zrow is None:
+                        raise NotFoundError(f"危险区不存在: {zid}")
+                zone_rows[zid] = zrow
+
+            # 各涉及区占用区间（同一快照数据，纯计算；沿用插值/窗口/带洞边界/半开裁剪）
+            occupancy: Dict[str, List[Tuple[float, float]]] = {
+                zid: self._coverage_intervals(zrow, points, lo, hi)
+                for zid, zrow in zone_rows.items()
+            }
+
+        # ---- 区间传播：求每道工序全部可行的证据开始时刻集（闭区间并）----
+        # 证据 [x, x+d) 落在一次连续占用 [s, e) 内 ⟺ x ∈ [s, e−d]；
+        # 后道开始 x' 须满足 前道结束 ≤ x' ≤ 前道结束 + 交接上限。
+        durations = [st["min_stay_sec"] for st in steps]
+        start_sets: List[List[Tuple[float, float]]] = []
+        for st in steps:
+            d = st["min_stay_sec"]
+            starts: List[Tuple[float, float]] = []
+            for s, e in occupancy[st["zone_id"]]:
+                b = e - d
+                if b >= s - 1e-9:
+                    starts.append((s, max(s, b)))
+            start_sets.append(self._merge_closed_starts(starts))
+
+        reachable: List[List[Tuple[float, float]]] = [start_sets[0]]
+        for i in range(1, len(steps)):
+            if not reachable[-1]:
+                reachable.append([])
+                continue
+            handover = steps[i]["max_handover_sec"]
+            # 前道可行结束时刻集 ⊕ [0, 交接上限]，再与本道可行开始集求交
+            expanded = self._merge_closed_starts(
+                [
+                    (a + durations[i - 1], b + durations[i - 1] + handover)
+                    for a, b in reachable[-1]
+                ]
+            )
+            reachable.append(self._intersect_closed_starts(start_sets[i], expanded))
+
+        completed = bool(reachable[-1])
+        evidence: List[Tuple[float, float]] = []
+        finished_epoch: Optional[float] = None
+        if completed:
+            # 最早最终结束时刻 = 最后一道最早可行开始 + 其停留秒数；再逐道回溯证据
+            xs = [0.0] * len(steps)
+            xs[-1] = reachable[-1][0][0]
+            for i in range(len(steps) - 1, 0, -1):
+                handover = steps[i]["max_handover_sec"]
+                target = [
+                    (
+                        xs[i] - durations[i - 1] - handover - 1e-9,
+                        xs[i] - durations[i - 1] + 1e-9,
+                    )
+                ]
+                cand = self._intersect_closed_starts(reachable[i - 1], target)
+                xs[i - 1] = max(b for _a, b in cand)
+            evidence = [(xs[i], xs[i] + durations[i]) for i in range(len(steps))]
+            finished_epoch = xs[-1] + durations[-1]
+
+        response_steps: List[Dict[str, Any]] = []
+        for st in steps:
+            item: Dict[str, Any] = {
+                "zone_id": st["zone_id"],
+                "min_stay_sec": st["min_stay_sec"],
+            }
+            if st["max_handover_sec"] is not None:
+                item["max_handover_sec"] = st["max_handover_sec"]
+            response_steps.append(item)
+
+        return {
+            "trip_id": trip_id,
+            "since": _iso_z(datetime.fromtimestamp(lo, timezone.utc)),
+            "until": _iso_z(datetime.fromtimestamp(hi, timezone.utc)),
+            "steps": response_steps,
+            "completed": completed,
+            "finished_at": (
+                None
+                if finished_epoch is None
+                else _iso_z(datetime.fromtimestamp(finished_epoch, timezone.utc))
+            ),
+            "evidence": [
+                {
+                    "step": i + 1,
+                    "zone_id": steps[i]["zone_id"],
+                    "start": _iso_z(datetime.fromtimestamp(s, timezone.utc)),
+                    "end": _iso_z(datetime.fromtimestamp(e, timezone.utc)),
+                    "duration_sec": round(e - s, 6),
+                }
+                for i, (s, e) in enumerate(evidence)
+            ],
+            "point_count": len(points),
+            "revision": used_revision,
+            "track_version": used_version,
+        }

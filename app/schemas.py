@@ -245,6 +245,52 @@ class PermitRevoke(BaseModel):
     )
 
 
+class SequenceStep(BaseModel):
+    """一道有序工序：须在该危险区的一次连续占用中取得足额连续停留证据。
+
+    第二道起（服务层强制）必须另给非负且有限的最长交接秒数 max_handover_sec；
+    第一道工序无前序交接，不得提供该字段。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    zone_id: str = Field(
+        ..., min_length=1, description="该工序须进入的危险区 ID（不同工序允许重复同一区）"
+    )
+    min_stay_sec: float = Field(
+        ...,
+        gt=0,
+        allow_inf_nan=False,
+        description="正且有限的连续停留秒数：证据时段须取自一次连续占用",
+    )
+    max_handover_sec: Optional[float] = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+        description="第二道起必填：非负且有限的最长交接秒数（本道证据开始 − 前道证据结束 ≤ 该值）",
+    )
+
+
+class SequenceReviewQuery(BaseModel):
+    """作业车工序顺序复核请求：是否按给定工序顺序进入危险区。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    since: str = Field(..., description="查询起始 UTC ISO 8601（含），必须带时区")
+    until: str = Field(..., description="查询结束 UTC ISO 8601（不含），必须带时区")
+    steps: List[SequenceStep] = Field(
+        ..., min_length=2, description="至少两道有序工序；允许同一危险区重复出现"
+    )
+    revision: Optional[int] = Field(
+        default=None, ge=1, description="可选区域修订号：按截至该号的区域配置核算"
+    )
+    track_version: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="可选轨迹版本号：按该版本保留的有效点集核算，响应回填实际使用版本",
+    )
+
+
 class PermitReviewQuery(BaseModel):
     """单车次多危险区通行许可复核请求：核对实际占用是否被许可覆盖。"""
 

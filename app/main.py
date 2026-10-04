@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from .config import get_settings
 from .db import Database
-from .schemas import CoOccupancyQuery, ContactTracingQuery, CorrectionBatch, PermitCreate, PermitReviewQuery, PermitRevoke, PointBatch, ProximityQuery, RiskBudgetQuery, SpeedingReviewQuery, ZoneCreate
+from .schemas import CoOccupancyQuery, ContactTracingQuery, CorrectionBatch, PermitCreate, PermitReviewQuery, PermitRevoke, PointBatch, ProximityQuery, RiskBudgetQuery, SequenceReviewQuery, SpeedingReviewQuery, ZoneCreate
 from .service import AuditService, ConflictError, NotFoundError, ValidationError
 
 settings = get_settings()
@@ -26,7 +26,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="工地作业车危险区穿越审计服务",
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
     description=(
         "登记带洞米制多边形危险区及其 UTC 半开生效时段；每次登记原子产生全局递增修订号，"
@@ -57,6 +57,10 @@ app = FastAPI(
         "过期或重复撤销拒绝。许可复核按同一已提交读视图（可选区域修订号、轨迹版本、"
         "许可修订号；无许可时许可修订号为 0）核对单车次在各区的实际占用，"
         "重叠许可时段取并集，按区返回无许可的正时长区间、累计秒数与实际使用的三个版本。"
+        "作业车工序顺序复核按同一已提交读视图核对作业车是否按给定工序顺序进入危险区："
+        "每道工序须在一次连续占用中取得足额且互不重叠的证据时段，后一道开始不得早于"
+        "前一道结束且间隔不超过其交接上限（允许同一区重复出现）；能完成时返回最早最终"
+        "结束时刻与逐道证据区间及实际版本，无可行顺序返回未完成与空证据。"
     ),
 )
 
@@ -109,6 +113,7 @@ def index() -> dict:
             "GET  /api/v1/permits/{permit_id}",
             "GET  /api/v1/permit-revisions",
             "POST /api/v1/trips/{trip_id}/permit-review",
+            "POST /api/v1/trips/{trip_id}/sequence-review",
         ],
     }
 
@@ -337,6 +342,15 @@ def query_permit_review(trip_id: str, body: PermitReviewQuery) -> dict:
     许可修订视图下仍有效的许可（重叠时段取并集）；按区返回无许可正时长区间、累计秒数
     与实际使用的区域修订号、轨迹版本、许可修订号（无许可时为 0）。"""
     return service.query_permit_review(trip_id, body.model_dump())
+
+
+@app.post("/api/v1/trips/{trip_id}/sequence-review")
+def query_sequence_review(trip_id: str, body: SequenceReviewQuery) -> dict:
+    """作业车工序顺序复核：区域配置与车次点集从同一已提交读视图读取；
+    每道工序须在一次连续占用中取得足额且互不重叠的证据时段，后一道开始不得早于
+    前一道结束且间隔不超过其交接上限（允许同一区重复出现）；能完成时返回最早最终
+    结束时刻与逐道证据区间及实际版本，无可行顺序返回未完成与空证据。"""
+    return service.query_sequence_review(trip_id, body.model_dump())
 
 
 if __name__ == "__main__":
